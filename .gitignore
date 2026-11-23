@@ -1,0 +1,41 @@
+
+# Virtual environments
+.venv/
+venv/
+env/
+.yolo/
+__pycache__/
+*.py[cod]
+.yolo_inference/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+logs/
+tmp/
+temp/
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.onnx
+*.engine
+*.weights
+
+# Training outputs
+runs/
+wandb/
+mlruns/
+
+# Cache
+.cache/
