@@ -64,6 +64,7 @@ from classification_inferencing import (
     WBC_Classifier,
     normalize_box_metadata,
 )
+from gating_utils import verify_gated_object, is_gated_class
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DET_MODEL = "/media/sigtupleds/Data/urine_inference/models/urine_iter_4_11.onnx"
@@ -252,6 +253,14 @@ def parse_args():
                    help="IOU threshold for duplicate box suppression")
     p.add_argument("--containment_threshold", type=float, default=0.5,
                    help="Containment threshold for suppressing small boxes inside bigger ones")
+    p.add_argument("--enable_gating", action="store_true", default=True,
+                   help="Enable morphological gating verification for CO_DI, RBC, WBC, Yeast, and sperm (default: True)")
+    p.add_argument("--no_gating", dest="enable_gating", action="store_false",
+                   help="Disable morphological gating verification")
+    p.add_argument("--gating_action", default="relabel_rejected", choices=["relabel_rejected", "relabel_debris", "filter_out", "keep_unverified"],
+                   help="Action when gating fails: 'relabel_rejected' (relabel to <class>_rejected and save to class_name_rejected folder, default), 'relabel_debris' (relabel to Debris), 'filter_out' (drop detection), 'keep_unverified' (retain predicted class)")
+    p.add_argument("--gating_rejection_class", default="Debris",
+                   help="Class to reassign when gating verification fails (default: Debris)")
 
     args = p.parse_args()
     if args.csv_only:
@@ -807,6 +816,60 @@ def process_single_order(
                         bbox = [x1, y1, box_width, box_height]
                         patch = extract_isolated_patch_black(img, bbox, patch_size=args.patch_size)
 
+            # ── Morphological Gating Verification ──
+            orig_cls = final_cls
+            gating_verified = True
+            gating_reason = "class_not_gated"
+            gating_metrics = {}
+
+            if getattr(args, "enable_gating", True) and is_gated_class(orig_cls):
+                if patch is not None:
+                    gating_crop = patch
+                else:
+                    gating_crop = img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+
+                gating_meta = {
+                    "raw_w": box_width,
+                    "raw_h": box_height,
+                    "area": box_width * box_height,
+                    "aspect_ratio": round(float(box_width) / max(float(box_height), 1e-6), 4),
+                }
+
+                gating_verified, gated_cls, gating_reason, gating_metrics = verify_gated_object(
+                    gating_crop,
+                    orig_cls,
+                    meta=gating_meta,
+                    rejection_class=getattr(args, "gating_rejection_class", "Debris"),
+                )
+
+                if not gating_verified:
+                    # If patch was None, extract it so the rejected patch can be saved
+                    if patch is None and args.save_patches:
+                        if max(box_width, box_height) <= args.size_threshold:
+                            tight_crop = img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                            patch = prepare_micro_patch(tight_crop, target_size=80)
+                        else:
+                            bbox = [x1, y1, box_width, box_height]
+                            patch = extract_isolated_patch_black(img, bbox, patch_size=args.patch_size)
+
+                    action = getattr(args, "gating_action", "relabel_rejected")
+                    if action == "filter_out":
+                        # Save rejected patch to class_name_rejected folder before skipping
+                        if args.save_patches and patch is not None:
+                            t_save_start = time.perf_counter()
+                            cls_dir = os.path.join(classification_result_dir, f"{orig_cls}_rejected")
+                            os.makedirs(cls_dir, exist_ok=True)
+                            base_name = os.path.splitext(img_name)[0]
+                            patch_filename = f"{base_name}_det_{ann_id}_{orig_cls}_{final_conf:.2f}_{gating_reason}.jpg"
+                            patch_save_path = os.path.join(cls_dir, patch_filename)
+                            cv2.imwrite(patch_save_path, patch)
+                            patch_save_time += (time.perf_counter() - t_save_start)
+                        continue
+                    elif action == "relabel_rejected":
+                        final_cls = f"{orig_cls}_rejected"
+                    elif action == "relabel_debris":
+                        final_cls = gated_cls
+
             # Filter sperm if low confidence
             if final_cls in ("Sperm", "small_sperm") and final_conf < 0.5:
                 continue
@@ -835,23 +898,40 @@ def process_single_order(
                 "aspect_ratio": ar,
                 "detection_class": det_cls_name,
                 "detection_score": round(float(det_conf), 4),
-                "classified_class": final_cls,
+                "classified_class": orig_cls,
+                "final_gated_class": final_cls,
                 "confidence": round(float(final_conf), 4),
                 "classification_model": model_used,
+                "gating_verified": gating_verified,
+                "gating_reason": gating_reason,
             })
 
             # Save patch class-wise inside classification_result
-            if args.save_patches and patch is not None:
-                should_save = (args.save_patch_classes == "all") or (det_cls_name.lower() == "object")
+            if args.save_patches:
+                should_save = (args.save_patch_classes == "all") or (det_cls_name.lower() == "object") or (not gating_verified)
                 if should_save:
-                    t_save_start = time.perf_counter()
-                    cls_dir = os.path.join(classification_result_dir, final_cls)
-                    os.makedirs(cls_dir, exist_ok=True)
-                    base_name = os.path.splitext(img_name)[0]
-                    patch_filename = f"{base_name}_det_{ann_id}_{final_cls}_{final_conf:.2f}.jpg"
-                    patch_save_path = os.path.join(cls_dir, patch_filename)
-                    cv2.imwrite(patch_save_path, patch)
-                    patch_save_time += (time.perf_counter() - t_save_start)
+                    if patch is None:
+                        if max(box_width, box_height) <= args.size_threshold:
+                            tight_crop = img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                            patch = prepare_micro_patch(tight_crop, target_size=80)
+                        else:
+                            bbox = [x1, y1, box_width, box_height]
+                            patch = extract_isolated_patch_black(img, bbox, patch_size=args.patch_size)
+
+                    if patch is not None:
+                        t_save_start = time.perf_counter()
+                        # Save rejected patches into folder: <class_name>_rejected
+                        patch_save_cls = f"{orig_cls}_rejected" if not gating_verified else final_cls
+                        cls_dir = os.path.join(classification_result_dir, patch_save_cls)
+                        os.makedirs(cls_dir, exist_ok=True)
+                        base_name = os.path.splitext(img_name)[0]
+                        if not gating_verified:
+                            patch_filename = f"{base_name}_det_{ann_id}_{orig_cls}_{final_conf:.2f}_{gating_reason}.jpg"
+                        else:
+                            patch_filename = f"{base_name}_det_{ann_id}_{final_cls}_{final_conf:.2f}.jpg"
+                        patch_save_path = os.path.join(cls_dir, patch_filename)
+                        cv2.imwrite(patch_save_path, patch)
+                        patch_save_time += (time.perf_counter() - t_save_start)
 
             # Draw bounding box
             if args.save_annotated and vis is not None:
@@ -876,10 +956,15 @@ def process_single_order(
             if args.save_coco:
                 bw = x2 - x1
                 bh = y2 - y1
+                cat_id = category_to_id.get(final_cls)
+                if cat_id is None:
+                    cat_id = len(category_to_id)
+                    category_to_id[final_cls] = cat_id
+                    coco["categories"].append({"id": cat_id, "name": final_cls})
                 coco["annotations"].append({
                     "id": ann_id,
                     "image_id": image_id,
-                    "category_id": category_to_id[final_cls],
+                    "category_id": cat_id,
                     "category_name": final_cls,
                     "bbox": [float(x1), float(y1), float(bw), float(bh)],
                     "area": float(bw * bh),
@@ -890,6 +975,9 @@ def process_single_order(
                     "classification_class": cls_name_classify,
                     "classification_score": float(cls_conf) if cls_conf is not None else None,
                     "classification_model": model_used,
+                    "original_class": orig_cls,
+                    "gating_verified": gating_verified,
+                    "gating_reason": gating_reason,
                 })
             ann_id += 1
 
@@ -920,7 +1008,7 @@ def process_single_order(
         # Determine element_present: 1 if any target element (excluding Debris) is detected, else 0
         has_element = any(
             cnt > 0 for cname, cnt in fov_final_counts.items()
-            if cname.lower() not in ["debris", "debries"]
+            if cname.lower() not in ["debris", "debries"] and not cname.endswith("_rejected")
         )
         element_present = 1 if has_element else 0
 
@@ -1018,7 +1106,8 @@ def process_single_order(
             "tray_id", "order_id", "image_name", "fov_number", "detection_id",
             "x1", "y1", "x2", "y2", "h", "w", "area", "aspect_ratio",
             "detection_class", "detection_score", "classified_class",
-            "confidence", "classification_model"
+            "final_gated_class", "confidence", "classification_model",
+            "gating_verified", "gating_reason"
         ]
         pd.DataFrame(columns=meta_cols).to_csv(meta_csv_path, index=False)
 
@@ -1058,6 +1147,10 @@ def main():
     print(f"Save Patches                   : {args.save_patches}")
     print(f"Save Annotated Bbox Images     : {args.save_annotated}")
     print(f"Save COCO JSON                 : {args.save_coco}")
+    print(f"Gating Verification            : {'Enabled' if getattr(args, 'enable_gating', True) else 'Disabled'}")
+    if getattr(args, "enable_gating", True):
+        print(f"  Gating Action                : {args.gating_action}")
+        print(f"  Gating Rejection Class       : {args.gating_rejection_class}")
     print()
 
     # ── Execution Mode: Batch vs Single Order ──
