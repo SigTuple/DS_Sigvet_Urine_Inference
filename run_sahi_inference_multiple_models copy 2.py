@@ -257,6 +257,11 @@ def parse_args():
                    help="Do not save predictions_coco.json file")
     p.add_argument("--save_patch_classes", default="all", choices=["all", "classified_only"],
                    help="Which classes to save patches for: 'all' (all detections) or 'classified_only' (only Object classified by classifier)")
+    p.add_argument("--save_crop_type", default="tight", choices=["tight", "halo", "canvas"],
+                   help="Format for saved patches in classification_result: "
+                        "'tight' (default: natural unscaled tight bbox crop img[y1:y2, x1:x2]), "
+                        "'halo' (unscaled crop with 8px/16px fluid halo), or "
+                        "'canvas' (padded 80x80/224x224 model canvas)")
     p.add_argument("--patch_dir_name", default="classification_result",
                    help="Subdirectory name inside output_dir to save class-wise patches (default: classification_result)")
     p.add_argument("--img_size", type=int, default=416, help="Slice / model input size")
@@ -569,6 +574,29 @@ def prepare_micro_patch(crop, target_size=80):
     return patch_80x80
 
 
+def get_crop_to_save(img, x1, y1, x2, y2, patch, crop_type="tight", halo=8):
+    """
+    Returns the image patch to save to disk based on crop_type:
+    - 'tight': natural unscaled tight crop img[y1:y2, x1:x2] matching the detection bounding box
+    - 'halo': unscaled crop including natural fluid halo margin img[hy1:hy2, hx1:hx2]
+    - 'canvas': the full padded model canvas (80x80 or 224x224)
+    """
+    if crop_type == "canvas":
+        return patch
+
+    ih, iw = img.shape[:2]
+    if crop_type == "halo":
+        hx1 = max(0, x1 - halo)
+        hy1 = max(0, y1 - halo)
+        hx2 = min(iw, x2 + halo)
+        hy2 = min(ih, y2 + halo)
+        crop = img[hy1:hy2, hx1:hx2]
+        return crop if (crop is not None and crop.size > 0) else patch
+    else:  # "tight"
+        crop = img[max(0, y1):min(ih, y2), max(0, x1):min(iw, x2)]
+        return crop if (crop is not None and crop.size > 0) else patch
+
+
 def get_patch(img, x1, y1, x2, y2, patch_size=224):
     """
     Compatibility wrapper around extract_isolated_patch_black.
@@ -788,15 +816,18 @@ def process_single_order(
     class_counts = defaultdict(int)
     class_mapping = CLASS_MAPPING_LOOKUP[args.model_type]
 
-    image_paths = sorted(
-        glob(os.path.join(input_dir, "*.jpg"))
-        + glob(os.path.join(input_dir, "*.jpeg"))
-        + glob(os.path.join(input_dir, "*.png"))
-    )
+    if os.path.isfile(input_dir) and input_dir.lower().endswith((".jpg", ".jpeg", ".png")):
+        image_paths = [input_dir]
+    else:
+        image_paths = sorted(
+            glob(os.path.join(input_dir, "*.jpg"))
+            + glob(os.path.join(input_dir, "*.jpeg"))
+            + glob(os.path.join(input_dir, "*.png"))
+        )
 
     if not image_paths:
         print(f"No images found in {input_dir}, skipping.")
-        return [], {}, [], {}, {}
+        return [], {}, [], {}, {}, []
 
     # Standard classes for raw detection and final classification
     all_det_classes = list(dict.fromkeys(STANDARD_DETECTION_CLASSES + list(class_mapping.values())))
@@ -1001,14 +1032,20 @@ def process_single_order(
                     action = getattr(args, "gating_action", "relabel_rejected")
                     if action == "filter_out":
                         # Save rejected patch to class_name_rejected folder before skipping
-                        if args.save_patches and patch is not None:
+                        if args.save_patches:
                             t_save_start = time.perf_counter()
                             cls_dir = os.path.join(classification_result_dir, f"{orig_cls}_rejected")
                             os.makedirs(cls_dir, exist_ok=True)
                             base_name = os.path.splitext(img_name)[0]
                             patch_filename = f"{base_name}_det_{ann_id}_{orig_cls}_{final_conf:.2f}_{gating_reason}.jpg"
                             patch_save_path = os.path.join(cls_dir, patch_filename)
-                            cv2.imwrite(patch_save_path, patch)
+                            save_crop = get_crop_to_save(
+                                img, x1, y1, x2, y2, patch,
+                                crop_type=getattr(args, "save_crop_type", "tight"),
+                                halo=8 if max(box_width, box_height) <= args.size_threshold else 16
+                            )
+                            if save_crop is not None and save_crop.size > 0:
+                                cv2.imwrite(patch_save_path, save_crop)
                             patch_save_time += (time.perf_counter() - t_save_start)
                         continue
                     elif action == "relabel_rejected":
@@ -1078,21 +1115,29 @@ def process_single_order(
             if args.save_patches:
                 should_save = (args.save_patch_classes == "all") or (det_cls_name.lower() == "object") or (not gating_verified)
                 if should_save:
-                    if patch is None:
-                        if max(box_width, box_height) <= args.size_threshold:
-                            if getattr(args, "pad_mode", "fluid") == "fluid":
-                                patch, _ = extract_1to1_fluid_patch(img, x1, y1, box_width, box_height, halo=8, target_size=80)
-                            else:
-                                tight_crop = img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                                patch = prepare_micro_patch(tight_crop, target_size=80)
-                        else:
-                            if getattr(args, "pad_mode", "fluid") == "fluid":
-                                patch, _ = extract_1to1_fluid_patch(img, x1, y1, box_width, box_height, halo=16, target_size=args.patch_size)
-                            else:
-                                bbox = [x1, y1, box_width, box_height]
-                                patch = extract_isolated_patch_black(img, bbox, patch_size=args.patch_size)
+                    save_crop = get_crop_to_save(
+                        img, x1, y1, x2, y2, patch,
+                        crop_type=getattr(args, "save_crop_type", "tight"),
+                        halo=8 if max(box_width, box_height) <= args.size_threshold else 16
+                    )
 
-                    if patch is not None:
+                    if save_crop is None or save_crop.size == 0:
+                        if patch is None:
+                            if max(box_width, box_height) <= args.size_threshold:
+                                if getattr(args, "pad_mode", "fluid") == "fluid":
+                                    patch, _ = extract_1to1_fluid_patch(img, x1, y1, box_width, box_height, halo=8, target_size=80)
+                                else:
+                                    tight_crop = img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                                    patch = prepare_micro_patch(tight_crop, target_size=80)
+                            else:
+                                if getattr(args, "pad_mode", "fluid") == "fluid":
+                                    patch, _ = extract_1to1_fluid_patch(img, x1, y1, box_width, box_height, halo=16, target_size=args.patch_size)
+                                else:
+                                    bbox = [x1, y1, box_width, box_height]
+                                    patch = extract_isolated_patch_black(img, bbox, patch_size=args.patch_size)
+                        save_crop = patch
+
+                    if save_crop is not None and save_crop.size > 0:
                         t_save_start = time.perf_counter()
                         # Save rejected patches into folder: <class_name>_rejected
                         patch_save_cls = f"{orig_cls}_rejected" if not gating_verified else final_cls
@@ -1104,7 +1149,7 @@ def process_single_order(
                         else:
                             patch_filename = f"{base_name}_det_{ann_id}_{final_cls}_{final_conf:.2f}.jpg"
                         patch_save_path = os.path.join(cls_dir, patch_filename)
-                        cv2.imwrite(patch_save_path, patch)
+                        cv2.imwrite(patch_save_path, save_crop)
                         patch_save_time += (time.perf_counter() - t_save_start)
 
             # Draw bounding box
@@ -1322,6 +1367,10 @@ def main():
     print(f"Dedup                          : iou_threshold={args.iou_threshold}  containment_threshold={args.containment_threshold}")
     print(f"Mode                           : {'CSV ONLY (zero images/patches written)' if args.csv_only else 'Standard'}")
     print(f"Save Patches                   : {args.save_patches}")
+    if args.save_patches:
+        crop_desc = 'unscaled tight crop' if args.save_crop_type == 'tight' else 'crop + fluid halo' if args.save_crop_type == 'halo' else 'model canvas (80x80/224x224)'
+        print(f"  Patch Crop Format            : {args.save_crop_type} ({crop_desc})")
+        print(f"  Patch Classes                : {args.save_patch_classes}")
     print(f"Save Annotated Bbox Images     : {args.save_annotated}")
     print(f"Save COCO JSON                 : {args.save_coco}")
     print(f"Gating Verification            : {'Enabled' if getattr(args, 'enable_gating', True) else 'Disabled'}")
