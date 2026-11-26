@@ -326,60 +326,120 @@ def verify_yeast(crop: np.ndarray, bg: float, meta: Optional[Dict[str, Any]] = N
     """
     Gating logic for Yeast:
     - Must possess 2 or more round structures (budding yeast pairs, clusters, or chains).
+    - Solitary single round cells (e.g. unbudded yeast, solitary RBCs, round debris) are strictly rejected.
     - Verified via:
-      1. Multiple distinct round contours (len(valid_cnts) >= 2).
-      2. Multiple local peaks in Euclidean distance transform (>= 2 round cell centers).
-      3. Multiple distinct components after morphological erosion / opening.
-      4. Conjoined budding morphology: deep waist constriction (defect depth >= 3.0 px) on elongated body (AR >= 1.30).
+      1. Multiple distinct round contours (len(round_cells) >= 2):
+         - Each cell contour must have cellular size (area >= 25 px²), high convex hull circularity (>= 0.68),
+           solidity (>= 0.72), and bounded aspect ratio (<= 1.85).
+         - At least one primary cell (area >= 50 px²), and the pair must be in close proximity (centroid distance <= 50 px).
+      2. Conjoined budding yeast (snowman / dumbbell / figure-8 mother + bud):
+         - Must be elongated (oriented minAreaRect aspect ratio >= 1.25) to avoid false-triggering on solitary round cells.
+         - Verified constriction neck between lobes via:
+           a) Morphological neck erosion (k in [3, 5, 7, 9]): splits body into >= 2 round lobes (each lobe area >= 12 px², circularity >= 0.65).
+           b) Euclidean Distance Transform dual peaks: >= 2 distinct peak components (inscribed radius >= 3.5 px) separated by >= 8 px,
+              with a prominent saddle drop (valley <= 0.82 * min(R1, R2)) along the line connecting the peaks.
     """
     metrics: Dict[str, Any] = {}
+    if crop is None or crop.shape[0] < 8 or crop.shape[1] < 8:
+        return False, "crop_too_small", metrics
+
+    if meta is not None:
+        metrics["meta_ar"] = float(meta.get("aspect_ratio", 1.0))
+        metrics["meta_area"] = float(meta.get("area", 0.0))
+
     diff = np.abs(crop.astype(float) - bg)
     _, th = cv2.threshold(diff.astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 1. Multiple distinct contours
+    # 1. Distinct discrete round structures (separated or lightly touching cells)
     cnts_raw, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid_raw = [c for c in cnts_raw if cv2.contourArea(c) >= 20]
-    metrics["distinct_contours"] = len(valid_raw)
-    if len(valid_raw) >= 2:
-        return True, "multiple_round_contours", metrics
+    round_cells = []
+    centroids = []
+    for c in cnts_raw:
+        area = cv2.contourArea(c)
+        if area >= 25:
+            hull = cv2.convexHull(c)
+            h_area = cv2.contourArea(hull)
+            h_peri = cv2.arcLength(hull, True)
+            h_circ = (4 * np.pi * h_area) / (h_peri**2) if h_peri > 0 else 0.0
+            solidity = area / (h_area + 1e-5)
+            rect = cv2.minAreaRect(c)
+            rw, rh = rect[1]
+            ar = max(rw, rh) / (min(rw, rh) + 1e-5)
+            if h_circ >= 0.68 and solidity >= 0.72 and ar <= 1.85:
+                round_cells.append(c)
+                M = cv2.moments(c)
+                if M["m00"] > 0:
+                    centroids.append((M["m10"] / M["m00"], M["m01"] / M["m00"]))
 
-    # 2. Distance transform local maxima (cell nuclei/centers)
-    dist = cv2.distanceTransform(th, cv2.DIST_L2, 5)
-    dil = cv2.dilate(dist, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-    peaks = (dist == dil) & (dist >= 3)
-    num_peaks = int(np.sum(peaks))
-    metrics["distance_peaks"] = num_peaks
-    if num_peaks >= 2:
-        return True, "multiple_round_peaks", metrics
+    if len(round_cells) >= 2:
+        areas = [cv2.contourArea(c) for c in round_cells]
+        if max(areas) >= 50:
+            for i in range(len(centroids)):
+                for j in range(i + 1, len(centroids)):
+                    d = np.hypot(centroids[i][0] - centroids[j][0], centroids[i][1] - centroids[j][1])
+                    if d <= 50.0:
+                        metrics["round_cells"] = len(round_cells)
+                        metrics["min_cell_dist"] = round(d, 1)
+                        return True, "multiple_discrete_round_cells", metrics
 
-    # 3. Morphological erosion separating touching buds
-    for k_size in [(5, 5), (3, 3)]:
-        eroded = cv2.erode(th, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, k_size), iterations=1)
-        cnts_e, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid_e = [c for c in cnts_e if cv2.contourArea(c) >= 12]
-        if len(valid_e) >= 2:
-            metrics["eroded_components"] = len(valid_e)
-            return True, "budding_eroded_split", metrics
+    # 2. Conjoined budding yeast (snowman / dumbbell / figure-8)
+    if cnts_raw:
+        c = max(cnts_raw, key=cv2.contourArea)
+        area = cv2.contourArea(c)
+        if area >= 60:
+            rect = cv2.minAreaRect(c)
+            rw, rh = rect[1]
+            body_ar = max(rw, rh) / (min(rw, rh) + 1e-5)
+            metrics["body_aspect_ratio"] = round(body_ar, 2)
 
-    # 4. Conjoined budding morphology: deep waist constriction between mother cell and bud
-    if valid_raw:
-        c = max(valid_raw, key=cv2.contourArea)
-        if len(c) > 3:
-            hull_idx = cv2.convexHull(c, returnPoints=False)
-            if hull_idx is not None and len(hull_idx) > 3:
-                defects = cv2.convexityDefects(c, hull_idx)
-                if defects is not None:
-                    depths = defects[:, 3] / 256.0
-                    max_depth = float(np.max(depths))
-                    rect = cv2.minAreaRect(c)
-                    rw, rh = rect[1]
-                    aspect = max(rw, rh) / (min(rw, rh) + 1e-5)
-                    metrics["waist_defect_depth"] = round(max_depth, 2)
-                    metrics["body_aspect_ratio"] = round(aspect, 2)
-                    if max_depth >= 3.0 and aspect >= 1.3:
-                        return True, "budding_waist_constriction", metrics
+            if body_ar >= 1.25:
+                # 2A. Morphological neck erosion into >= 2 round lobes
+                for k in [3, 5, 7, 9]:
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                    eroded = cv2.erode(th, kernel, iterations=1)
+                    sub_cnts, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    valid_lobes = []
+                    for sc in sub_cnts:
+                        s_area = cv2.contourArea(sc)
+                        if s_area >= 12:
+                            s_hull = cv2.convexHull(sc)
+                            s_h_area = cv2.contourArea(s_hull)
+                            s_h_peri = cv2.arcLength(s_hull, True)
+                            s_circ = (4 * np.pi * s_h_area) / (s_h_peri**2) if s_h_peri > 0 else 0.0
+                            if s_circ >= 0.65:
+                                valid_lobes.append(sc)
+                    if len(valid_lobes) >= 2:
+                        metrics["eroded_lobes"] = len(valid_lobes)
+                        return True, "budding_eroded_round_lobes", metrics
 
-    return False, "single_round_structure", metrics
+                # 2B. Euclidean Distance Transform Dual Peaks with Saddle Drop
+                dist = cv2.distanceTransform(th, cv2.DIST_L2, 5)
+                for min_r in [3.5, 4.0, 4.5]:
+                    peak_mask = (dist >= min_r).astype(np.uint8)
+                    num_p_labels, p_labels, p_stats, p_centroids = cv2.connectedComponentsWithStats(peak_mask)
+                    if num_p_labels >= 3:
+                        pts = p_centroids[1:]
+                        p_dists = [dist[int(pt[1]), int(pt[0])] for pt in pts]
+                        max_idx1 = np.argmax(p_dists)
+                        r1 = p_dists[max_idx1]
+                        pt1 = pts[max_idx1]
+                        for idx, (pt, r) in enumerate(zip(pts, p_dists)):
+                            if idx == max_idx1:
+                                continue
+                            d = np.hypot(pt[0] - pt1[0], pt[1] - pt1[1])
+                            if d >= 8.0 and r >= min_r:
+                                num_samples = max(5, int(d))
+                                xs = np.clip(np.linspace(pt1[0], pt[0], num_samples).astype(int), 0, crop.shape[1] - 1)
+                                ys = np.clip(np.linspace(pt1[1], pt[1], num_samples).astype(int), 0, crop.shape[0] - 1)
+                                profile = dist[ys, xs]
+                                saddle_min = np.min(profile)
+                                min_peak_r = min(r1, r)
+                                if saddle_min <= 0.82 * min_peak_r:
+                                    metrics["saddle_ratio"] = round(saddle_min / (min_peak_r + 1e-5), 2)
+                                    metrics["peak_sep"] = round(d, 1)
+                                    return True, "budding_distance_dual_peaks", metrics
+
+    return False, "solitary_cell_or_no_bud", metrics
 
 
 def verify_gated_object(
