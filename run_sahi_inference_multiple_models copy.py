@@ -253,14 +253,14 @@ def parse_args():
                    help="IOU threshold for duplicate box suppression")
     p.add_argument("--containment_threshold", type=float, default=0.5,
                    help="Containment threshold for suppressing small boxes inside bigger ones")
+    p.add_argument("--min_sperm_confidence", type=float, default=0.0,
+                   help="Drop Sperm/small_sperm predictions below this confidence (default: 0 keeps low-confidence candidates for review)")
     p.add_argument("--enable_gating", action="store_true", default=True,
                    help="Enable morphological gating verification for CO_DI, RBC, WBC, Yeast, and sperm (default: True)")
     p.add_argument("--no_gating", dest="enable_gating", action="store_false",
                    help="Disable morphological gating verification")
     p.add_argument("--gating_action", default="relabel_rejected", choices=["relabel_rejected", "relabel_debris", "filter_out", "keep_unverified"],
-                   help="Action when gating fails: 'relabel_rejected' (relabel to <class>_rejected and save to class_name_rejected folder, default), 'relabel_debris' (relabel to Debris), 'filter_out' (drop detection), 'keep_unverified' (retain predicted class)")
-    p.add_argument("--gating_rejection_class", default="Debris",
-                   help="Class to reassign when gating verification fails (default: Debris)")
+                   help="Action when gating fails: 'relabel_rejected' (relabel to <class>_rejected, default), 'relabel_debris' (also use the class-specific rejected label), 'filter_out' (drop detection), 'keep_unverified' (retain predicted class)")
 
     args = p.parse_args()
     if args.csv_only:
@@ -341,11 +341,14 @@ def deduplicate_predictions(predictions, iou_threshold=0.4, containment_threshol
 
             iou, containment = compute_iou_containment(box_i, box_j)
 
-            if iou >= iou_threshold:
+            # Only suppress boxes from the same detector class. Different
+            # classes may overlap legitimately (for example, adjacent cells).
+            same_class = pred_i.category.name == pred_j.category.name
+            if same_class and iou >= iou_threshold:
                 suppressed[j] = True
                 continue
 
-            if containment >= containment_threshold:
+            if same_class and containment >= containment_threshold:
                 suppressed[j] = True
 
     return kept
@@ -747,6 +750,13 @@ def process_single_order(
             perform_standard_pred=False,
             verbose=0,
         )
+        # SAHI can return duplicate boxes for one object across slices.
+        # Suppress these before classification so one cell is not counted twice.
+        result.object_prediction_list = deduplicate_predictions(
+            result.object_prediction_list,
+            iou_threshold=args.iou_threshold,
+            containment_threshold=args.containment_threshold,
+        )
         det_time = time.perf_counter() - t_det_start
 
         vis = img.copy() if args.save_annotated else None
@@ -839,39 +849,22 @@ def process_single_order(
                     gating_crop,
                     orig_cls,
                     meta=gating_meta,
-                    rejection_class=getattr(args, "gating_rejection_class", "Debris"),
+                    rejection_class=f"{orig_cls}_rejected",
                 )
 
                 if not gating_verified:
-                    # If patch was None, extract it so the rejected patch can be saved
-                    if patch is None and args.save_patches:
-                        if max(box_width, box_height) <= args.size_threshold:
-                            tight_crop = img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                            patch = prepare_micro_patch(tight_crop, target_size=80)
-                        else:
-                            bbox = [x1, y1, box_width, box_height]
-                            patch = extract_isolated_patch_black(img, bbox, patch_size=args.patch_size)
-
                     action = getattr(args, "gating_action", "relabel_rejected")
                     if action == "filter_out":
-                        # Save rejected patch to class_name_rejected folder before skipping
-                        if args.save_patches and patch is not None:
-                            t_save_start = time.perf_counter()
-                            cls_dir = os.path.join(classification_result_dir, f"{orig_cls}_rejected")
-                            os.makedirs(cls_dir, exist_ok=True)
-                            base_name = os.path.splitext(img_name)[0]
-                            patch_filename = f"{base_name}_det_{ann_id}_{orig_cls}_{final_conf:.2f}_{gating_reason}.jpg"
-                            patch_save_path = os.path.join(cls_dir, patch_filename)
-                            cv2.imwrite(patch_save_path, patch)
-                            patch_save_time += (time.perf_counter() - t_save_start)
                         continue
                     elif action == "relabel_rejected":
                         final_cls = f"{orig_cls}_rejected"
                     elif action == "relabel_debris":
                         final_cls = gated_cls
 
-            # Filter sperm if low confidence
-            if final_cls in ("Sperm", "small_sperm") and final_conf < 0.5:
+            # Keep uncertain sperm candidates by default for review. Set a
+            # positive --min_sperm_confidence to filter them explicitly.
+            if (final_cls in ("Sperm", "small_sperm")
+                    and final_conf < args.min_sperm_confidence):
                 continue
 
             class_counts[final_cls] += 1
@@ -906,9 +899,11 @@ def process_single_order(
                 "gating_reason": gating_reason,
             })
 
-            # Save patch class-wise inside classification_result
+            # Save rejected patches under their original class-specific folder.
             if args.save_patches:
-                should_save = (args.save_patch_classes == "all") or (det_cls_name.lower() == "object") or (not gating_verified)
+                should_save = ((args.save_patch_classes == "all")
+                               or (det_cls_name.lower() == "object")
+                               or not gating_verified)
                 if should_save:
                     if patch is None:
                         if max(box_width, box_height) <= args.size_threshold:
@@ -920,15 +915,11 @@ def process_single_order(
 
                     if patch is not None:
                         t_save_start = time.perf_counter()
-                        # Save rejected patches into folder: <class_name>_rejected
                         patch_save_cls = f"{orig_cls}_rejected" if not gating_verified else final_cls
                         cls_dir = os.path.join(classification_result_dir, patch_save_cls)
                         os.makedirs(cls_dir, exist_ok=True)
                         base_name = os.path.splitext(img_name)[0]
-                        if not gating_verified:
-                            patch_filename = f"{base_name}_det_{ann_id}_{orig_cls}_{final_conf:.2f}_{gating_reason}.jpg"
-                        else:
-                            patch_filename = f"{base_name}_det_{ann_id}_{final_cls}_{final_conf:.2f}.jpg"
+                        patch_filename = f"{base_name}_det_{ann_id}_{patch_save_cls}_{final_conf:.2f}.jpg"
                         patch_save_path = os.path.join(cls_dir, patch_filename)
                         cv2.imwrite(patch_save_path, patch)
                         patch_save_time += (time.perf_counter() - t_save_start)
@@ -1150,7 +1141,7 @@ def main():
     print(f"Gating Verification            : {'Enabled' if getattr(args, 'enable_gating', True) else 'Disabled'}")
     if getattr(args, "enable_gating", True):
         print(f"  Gating Action                : {args.gating_action}")
-        print(f"  Gating Rejection Class       : {args.gating_rejection_class}")
+        print("  Gating Rejection Label       : <original_class>_rejected")
     print()
 
     # ── Execution Mode: Batch vs Single Order ──

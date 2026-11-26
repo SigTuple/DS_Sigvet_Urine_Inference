@@ -8,6 +8,9 @@ for candidate objects to filter out false positives and misclassifications:
 - small_sperm / Sperm: Distinct head (compact/rounded blob) and tail (slender flagellum).
 - WBC: Circular shape, strictly rejecting degenerated cells (ruptured membranes, low solidity, ragged lysis borders).
 - Yeast: 2 or more round structures (budding yeast, blastoconidia pairs, clusters, or chains).
+- EP_SQ: Squamous epithelial cell - very large, solid element (box area + side length + element solidity/fill).
+- EP_TR: Transitional epithelial cell - larger than WBC/RBC AND round/oval (circularity on a smoothed outline).
+- Struvite / small_struvite morphology verifiers are retained below but currently disabled in gating.
 """
 
 import os
@@ -24,14 +27,22 @@ GATED_CLASSES = {
     "small_sperm",
     "Sperm",
     "sperm",
+    "EP_SQ",
+    "EP_TR",
 }
+
+_GATED_LOWER = {
+    "sperm", "small_sperm", "co_di", "rbc", "wbc", "yeast",
+    "ep_sq", "ep_tr",
+}
+
 
 
 def is_gated_class(class_name: Optional[str]) -> bool:
     """Returns True if the class has gating verification rules."""
     if not class_name:
         return False
-    return class_name in GATED_CLASSES or class_name.lower() in {"sperm", "small_sperm", "co_di", "rbc", "wbc", "yeast"}
+    return class_name in GATED_CLASSES or class_name.lower() in _GATED_LOWER
 
 
 def extract_foreground_crop(img: np.ndarray) -> Tuple[Optional[np.ndarray], float]:
@@ -322,71 +333,369 @@ def verify_wbc(crop: np.ndarray, bg: float, meta: Optional[Dict[str, Any]] = Non
     return True, "verified_intact_wbc", metrics
 
 
-def verify_yeast(crop: np.ndarray, bg: float, meta: Optional[Dict[str, Any]] = None) -> Tuple[bool, str, Dict[str, Any]]:
+def _blob_shape(c: np.ndarray) -> Tuple[float, float, float, float, float]:
+    """Return area, circularity, solidity, aspect ratio, and enclosing-circle fill."""
+    area = float(cv2.contourArea(c))
+    perimeter = float(cv2.arcLength(c, True))
+    circularity = min(4.0 * np.pi * area / (perimeter ** 2), 1.0) if perimeter > 0 else 0.0
+    hull_area = float(cv2.contourArea(cv2.convexHull(c)))
+    solidity = area / (hull_area + 1e-5)
+    rw, rh = cv2.minAreaRect(c)[1]
+    aspect = max(rw, rh) / (min(rw, rh) + 1e-5)
+    (_, _), radius = cv2.minEnclosingCircle(c)
+    circle_fill = area / (np.pi * radius * radius + 1e-5)
+    return area, circularity, solidity, aspect, circle_fill
+
+
+def _is_round_blob(c: np.ndarray, min_circ: float, min_solidity: float,
+                   max_aspect: float, min_circle_fill: float) -> bool:
+    _, circularity, solidity, aspect, circle_fill = _blob_shape(c)
+    return (circularity >= min_circ and solidity >= min_solidity
+            and aspect <= max_aspect and circle_fill >= min_circle_fill)
+
+
+def _split_touching_blobs(body_mask: np.ndarray) -> List[np.ndarray]:
+    """Split a merged body into candidate lobes using distance-transform seeds and watershed."""
+    distance = cv2.distanceTransform(body_mask, cv2.DIST_L2, 5)
+    max_distance = float(distance.max())
+    if max_distance < 3.0:
+        return []
+
+    for fraction in (0.80, 0.70, 0.60):
+        seeds = (distance >= fraction * max_distance).astype(np.uint8)
+        count, labels = cv2.connectedComponents(seeds)
+        if count - 1 < 2:
+            continue
+
+        markers = np.zeros(body_mask.shape, np.int32)
+        markers[body_mask == 0] = 1
+        markers[labels > 0] = labels[labels > 0] + 1
+        watershed_image = cv2.cvtColor(body_mask, cv2.COLOR_GRAY2BGR)
+        cv2.watershed(watershed_image, markers)
+
+        lobes = []
+        for label in range(2, count + 1):
+            component = (markers == label).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            if contours:
+                lobes.append(max(contours, key=cv2.contourArea))
+        if len(lobes) >= 2:
+            return lobes
+    return []
+
+
+def verify_yeast(crop: np.ndarray, bg: float, meta: Optional[Dict[str, Any]] = None,
+                 min_round: int = 2, min_blob_area: float = 30.0, min_circ: float = 0.80,
+                 min_solidity: float = 0.88, max_aspect: float = 1.5,
+                 min_circle_fill: float = 0.70) -> Tuple[bool, str, Dict[str, Any]]:
+    """Accept Yeast only for multiple round blobs or a merged body split into round lobes."""
+    metrics: Dict[str, Any] = {}
+    filled = _prep_mask(crop, bg, close_k=3)
+    contours, _ = cv2.findContours(filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    contours = [c for c in contours if cv2.contourArea(c) >= min_blob_area]
+    metrics["distinct_contours"] = len(contours)
+    if not contours:
+        return False, "no_contours_found", metrics
+
+    # Separate blobs must each have round, compact geometry.
+    round_contours = [
+        c for c in contours
+        if _is_round_blob(c, min_circ, min_solidity, max_aspect, min_circle_fill)
+    ]
+    metrics["round_structures"] = len(round_contours)
+    if len(round_contours) >= min_round:
+        return True, "multiple_round_structures", metrics
+
+    # Touching buds must split into round lobes and have a visible waist.
+    body = max(contours, key=cv2.contourArea)
+    body_mask = np.zeros(filled.shape, np.uint8)
+    cv2.drawContours(body_mask, [body], -1, 255, -1)
+    lobes = _split_touching_blobs(body_mask)
+    metrics["lobes"] = len(lobes)
+    if len(lobes) >= max(2, min_round):
+        _, _, body_solidity, _, _ = _blob_shape(body)
+        metrics["body_solidity"] = round(body_solidity, 3)
+        lobe_shapes = [_blob_shape(c) for c in lobes]
+        if (body_solidity < 0.95
+                and all(area >= 12 and circularity >= min_circ - 0.05
+                        and aspect <= max_aspect and circle_fill >= min_circle_fill - 0.10
+                        for area, circularity, _, aspect, circle_fill in lobe_shapes)):
+            return True, "budding_round_lobes", metrics
+
+    _, body_circularity, body_solidity, body_aspect, body_circle_fill = _blob_shape(body)
+    metrics.update({
+        "body_circularity": round(body_circularity, 3),
+        "body_solidity": round(body_solidity, 3),
+        "body_aspect": round(body_aspect, 2),
+        "body_circle_fill": round(body_circle_fill, 3),
+    })
+    return False, ("single_round_structure" if len(round_contours) == 1 else "not_round"), metrics
+
+
+def _prep_mask(crop: np.ndarray, bg: float, smooth_sigma: float = 0.0, close_k: int = 5) -> np.ndarray:
     """
-    Gating logic for Yeast:
-    - Must possess 2 or more round structures (budding yeast pairs, clusters, or chains).
-    - Verified via:
-      1. Multiple distinct round contours (len(valid_cnts) >= 2).
-      2. Multiple local peaks in Euclidean distance transform (>= 2 round cell centers).
-      3. Multiple distinct components after morphological erosion / opening.
-      4. Conjoined budding morphology: deep waist constriction (defect depth >= 3.0 px) on elongated body (AR >= 1.30).
+    Shared segmentation for the large-element classes (EP_SQ / EP_TR / Struvite):
+    trims the blended 2 px rim left by patch resizing, pads with background so objects touching the
+    crop edge still close, Otsu-thresholds |crop - bg|, closes gaps and fills holes (pale interior).
+    """
+    t = 2
+    if crop.shape[0] > 4 * t + 8 and crop.shape[1] > 4 * t + 8:
+        crop = crop[t:-t, t:-t]
+    crop = cv2.copyMakeBorder(crop, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=int(bg))
+    diff = cv2.GaussianBlur(np.abs(crop.astype(np.float32) - bg), (0, 0), 1.0)
+    diff_u8 = np.clip(diff, 0, 255).astype(np.uint8)
+    if int(diff_u8.max()) < 12:                      # no contrast against background
+        return np.zeros(crop.shape[:2], np.uint8)
+    _, th = cv2.threshold(diff_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k)))
+
+    # Hole filling for cellular / crystal interior
+    ch, cw = th.shape
+    th_fill = th.copy()
+    mf = np.zeros((ch + 2, cw + 2), np.uint8)
+    cv2.floodFill(th_fill, mf, (0, 0), 255)
+    filled = th | cv2.bitwise_not(th_fill)
+
+    if smooth_sigma > 0:                             # fair perimeter for circularity
+        sm = cv2.GaussianBlur(filled, (0, 0), smooth_sigma)
+        filled = ((sm > 127) * 255).astype(np.uint8)
+    return filled
+
+
+def _meta_dims(meta: Optional[Dict[str, Any]], metrics: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    """Reads (ar, area, w, h) from meta (original-image pixels) and records them in metrics."""
+    if meta is None:
+        return None
+    ar = float(meta.get("aspect_ratio", 1.0))
+    area = float(meta.get("area", 1000.0))
+    w = float(meta.get("raw_w", meta.get("w", 35.0)))
+    h = float(meta.get("raw_h", meta.get("h", 35.0)))
+    metrics["meta_ar"] = ar
+    metrics["meta_area"] = area
+    metrics["meta_w"] = w
+    metrics["meta_h"] = h
+    return ar, area, w, h
+
+
+def verify_ep_sq(crop: np.ndarray, bg: float, meta: Optional[Dict[str, Any]] = None,
+                 min_area: float = 3000.0, min_side: float = 35.0,
+                 min_solidity: float = 0.55, min_fill: float = 0.30) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Gating logic for EP_SQ (Squamous epithelial cell):
+    - Size check (main rule): box area >= 3000 px² and shortest side >= 35 px (squamous cells are far
+      bigger than WBC / RBC / yeast / bacteria / debris; rejects thin strands).
+    - Element check: the largest hole-filled element must be solid (area / hull area >= 0.55,
+      rejects stringy / fragmented clumps) and cover >= 30% of the crop (rejects a speck in a big box).
     """
     metrics: Dict[str, Any] = {}
-    diff = np.abs(crop.astype(float) - bg)
-    _, th = cv2.threshold(diff.astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    dims = _meta_dims(meta, metrics)
+    if dims is not None:
+        _, area, w, h = dims
+        if area < min_area:
+            return False, "too_small", metrics
+        if min(w, h) < min_side:
+            return False, "too_thin", metrics
 
-    # 1. Multiple distinct contours
-    cnts_raw, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid_raw = [c for c in cnts_raw if cv2.contourArea(c) >= 20]
-    metrics["distinct_contours"] = len(valid_raw)
-    if len(valid_raw) >= 2:
-        return True, "multiple_round_contours", metrics
+    filled = _prep_mask(crop, bg)
+    cnts, _ = cv2.findContours(filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return False, "no_contours_found", metrics
 
-    # 2. Distance transform local maxima (cell nuclei/centers)
-    dist = cv2.distanceTransform(th, cv2.DIST_L2, 5)
-    dil = cv2.dilate(dist, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-    peaks = (dist == dil) & (dist >= 3)
-    num_peaks = int(np.sum(peaks))
-    metrics["distance_peaks"] = num_peaks
-    if num_peaks >= 2:
-        return True, "multiple_round_peaks", metrics
+    c = max(cnts, key=cv2.contourArea)
+    el_area = cv2.contourArea(c)
+    h_area = cv2.contourArea(cv2.convexHull(c))
+    solidity = el_area / (h_area + 1e-5)
+    fill = el_area / float(max(crop.shape[0] * crop.shape[1], 1))
+    metrics["element_area"] = round(float(el_area), 1)
+    metrics["solidity"] = round(float(solidity), 3)
+    metrics["fill_fraction"] = round(float(fill), 3)
 
-    # 3. Morphological erosion separating touching buds
-    for k_size in [(5, 5), (3, 3)]:
-        eroded = cv2.erode(th, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, k_size), iterations=1)
-        cnts_e, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid_e = [c for c in cnts_e if cv2.contourArea(c) >= 12]
-        if len(valid_e) >= 2:
-            metrics["eroded_components"] = len(valid_e)
-            return True, "budding_eroded_split", metrics
+    if dims is None and el_area < min_area:
+        return False, "too_small", metrics
+    if fill < min_fill:
+        return False, "element_too_sparse", metrics
+    if solidity < min_solidity:
+        return False, "not_solid", metrics
 
-    # 4. Conjoined budding morphology: deep waist constriction between mother cell and bud
-    if valid_raw:
-        c = max(valid_raw, key=cv2.contourArea)
-        if len(c) > 3:
-            hull_idx = cv2.convexHull(c, returnPoints=False)
-            if hull_idx is not None and len(hull_idx) > 3:
-                defects = cv2.convexityDefects(c, hull_idx)
-                if defects is not None:
-                    depths = defects[:, 3] / 256.0
-                    max_depth = float(np.max(depths))
-                    rect = cv2.minAreaRect(c)
-                    rw, rh = rect[1]
-                    aspect = max(rw, rh) / (min(rw, rh) + 1e-5)
-                    metrics["waist_defect_depth"] = round(max_depth, 2)
-                    metrics["body_aspect_ratio"] = round(aspect, 2)
-                    if max_depth >= 3.0 and aspect >= 1.3:
-                        return True, "budding_waist_constriction", metrics
+    return True, "verified_large_squamous", metrics
 
-    return False, "single_round_structure", metrics
 
+def verify_ep_tr(crop: np.ndarray, bg: float, meta: Optional[Dict[str, Any]] = None,
+                 min_area: float = 1000.0, min_circ: float = 0.50,
+                 max_box_ar: float = 2.2, min_fill: float = 0.30,
+                 smooth_sigma: float = 2.0) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Gating logic for EP_TR (Transitional / urothelial epithelial cell):
+    - Size check: box area >= 1000 px² (bigger than WBC / RBC / yeast / debris); no upper limit.
+    - Aspect ratio: box within 1/2.2 - 2.2 (round / oval, not a long strand).
+    - Round shape: circularity 4*pi*A/P² >= 0.50 on a smoothed outline (perfect circle = 1.0,
+      normal oval ~0.8, irregular / stringy clump much lower); element must cover >= 30% of the crop.
+    """
+    metrics: Dict[str, Any] = {}
+    dims = _meta_dims(meta, metrics)
+    if dims is not None:
+        ar, area, w, h = dims
+        if area < min_area:
+            return False, "too_small", metrics
+        if ar > max_box_ar or ar < 1.0 / max_box_ar:
+            return False, "aspect_ratio_out_of_bounds", metrics
+
+    filled = _prep_mask(crop, bg, smooth_sigma=smooth_sigma)
+    cnts, _ = cv2.findContours(filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    cnts = [c for c in cnts if cv2.contourArea(c) >= 60]
+    if not cnts:
+        return False, "no_contours_found", metrics
+
+    crop_area = float(max(crop.shape[0] * crop.shape[1], 1))
+
+    def circ_of(c):
+        peri = max(float(cv2.arcLength(c, True)), 1.0)
+        return min(4.0 * np.pi * cv2.contourArea(c) / (peri ** 2), 1.0)
+
+    # roundest element that is big enough relative to the crop (same pick rule as the screening script)
+    cands = [c for c in cnts if cv2.contourArea(c) / crop_area >= min_fill] or [max(cnts, key=cv2.contourArea)]
+    c = max(cands, key=circ_of)
+    el_area = cv2.contourArea(c)
+    circ = circ_of(c)
+    fill = el_area / crop_area
+    metrics["element_area"] = round(float(el_area), 1)
+    metrics["circularity"] = round(float(circ), 3)
+    metrics["fill_fraction"] = round(float(fill), 3)
+
+    if dims is None and el_area < min_area:
+        return False, "too_small", metrics
+    if fill < min_fill:
+        return False, "element_too_sparse", metrics
+    if circ < min_circ:
+        return False, "not_round", metrics
+
+    return True, "verified_round_transitional", metrics
+
+
+# Struvite, small_struvite, and Debris-rescue filters are disabled for now.
+# def verify_struvite(crop: np.ndarray, bg: float, meta: Optional[Dict[str, Any]] = None,
+#                     min_max_side: float = 30.0, min_area: float = 600.0,
+#                     min_rectangularity: float = 0.70, min_solidity: float = 0.85,
+#                     min_verts: int = 4, max_verts: int = 8, max_aspect: float = 5.0,
+#                     max_circ: float = 0.85, cluster_min_area: float = 1500.0,
+#                     cluster_min_lines: int = 4, eps_frac: float = 0.02,
+#                     min_contrast: float = 12.0) -> Tuple[bool, str, Dict[str, Any]]:
+#     """
+#     Gating logic for Struvite (triple phosphate, "coffin-lid" crystals):
+#     - Size check: longest box side >= 30 px and box area >= 600 px².
+#     - Prism shape: largest hole-filled element is rectangular - min-area-rectangle fill >= 0.70,
+#       solidity >= 0.85, 4-8 polygon vertices, long/short side ratio <= 5, and not round (circularity < 0.85).
+#     - Cluster fallback (overlapping / aggregated crystals): large element (>= 1500 px²) with >= 4 long
+#       straight edge segments (Canny + Hough) pointing in at least two different directions.
+#     """
+#     metrics: Dict[str, Any] = {}
+#     dims = _meta_dims(meta, metrics)
+#     if dims is not None:
+#         _, area, w, h = dims
+#         if max(w, h) < min_max_side or area < min_area:
+#             return False, "too_small", metrics
+#
+#     contrast = float(np.percentile(np.abs(crop.astype(np.float32) - bg), 99))
+#     metrics["contrast"] = round(contrast, 1)
+#     if contrast < min_contrast:
+#         return False, "low_contrast", metrics
+#
+#     filled = _prep_mask(crop, bg)
+#     cnts, _ = cv2.findContours(filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+#     cnts = [c for c in cnts if cv2.contourArea(c) >= 40]
+#     if not cnts:
+#         return False, "no_contours_found", metrics
+#
+#     c = max(cnts, key=cv2.contourArea)
+#     el_area = cv2.contourArea(c)
+#     peri = cv2.arcLength(c, True)
+#     h_area = cv2.contourArea(cv2.convexHull(c))
+#     solidity = el_area / (h_area + 1e-5)
+#     circ = min(4.0 * np.pi * el_area / (peri ** 2), 1.0) if peri > 0 else 0.0
+#
+#     rw, rh = cv2.minAreaRect(c)[1]
+#     rectangularity = min(el_area / max(float(rw * rh), 1.0), 1.0)
+#     aspect = max(rw, rh) / (min(rw, rh) + 1e-5)
+#     verts = len(cv2.approxPolyDP(c, eps_frac * peri, True))
+#     metrics.update({
+#         "element_area": round(float(el_area), 1), "rectangularity": round(float(rectangularity), 3),
+#         "solidity": round(float(solidity), 3), "vertices": int(verts),
+#         "rect_aspect": round(float(aspect), 2), "circularity": round(float(circ), 3),
+#     })
+#
+#     if dims is None and (el_area < min_area or max(rw, rh) < min_max_side):
+#         return False, "too_small", metrics
+#     if circ >= max_circ:
+#         return False, "round_not_prism", metrics
+#
+#     if (rectangularity >= min_rectangularity and solidity >= min_solidity
+#             and min_verts <= verts <= max_verts and aspect <= max_aspect):
+#         return True, "verified_rectangular_prism", metrics
+#
+#     # Cluster fallback: several straight edges in more than one direction
+#     if el_area >= cluster_min_area:
+#         edges = cv2.Canny(cv2.GaussianBlur(crop, (3, 3), 0), 40, 120)
+#         lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=20, minLineLength=15, maxLineGap=3)
+#         angs = []
+#         if lines is not None:
+#             # OpenCV normally returns (N, 1, 4), but some builds return
+#             # (N, 4) or a single flattened line. Normalize the shape first.
+#             line_data = np.asarray(lines)
+#             if line_data.size % 4 == 0:
+#                 line_data = line_data.reshape(-1, 4)
+#             else:
+#                 line_data = np.empty((0, 4), dtype=np.int32)
+#             for x1, y1, x2, y2 in line_data:
+#                 angs.append(float(np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180.0))
+#         metrics["straight_edges"] = len(angs)
+#         if len(angs) >= cluster_min_lines:
+#             def adiff(a):
+#                 d = abs(a - angs[0]) % 180.0
+#                 return min(d, 180.0 - d)
+#             if any(adiff(a) > 20.0 for a in angs):
+#                 return True, "verified_crystal_cluster", metrics
+#
+#     return False, "not_rectangular_prism", metrics
+#
+#
+# def verify_small_struvite(crop: np.ndarray, bg: float,
+#                           meta: Optional[Dict[str, Any]] = None) -> Tuple[bool, str, Dict[str, Any]]:
+#     """Apply the Struvite prism check with small-crystal size limits."""
+#     return verify_struvite(
+#         crop, bg, meta,
+#         min_max_side=12.0, min_area=120.0,
+#         min_rectangularity=0.65, min_solidity=0.80,
+#         min_verts=4, max_verts=8, max_aspect=5.0, max_circ=0.85,
+#         cluster_min_area=400.0, cluster_min_lines=4,
+#         eps_frac=0.04, min_contrast=12.0,
+#     )
+#
+#
+# def rescue_struvite_from_debris(patch: Optional[np.ndarray],
+#                                 meta: Optional[Dict[str, Any]] = None,
+#                                 min_side: float = 30.0) -> Tuple[bool, str, Dict[str, Any]]:
+#     """Use a strict rectangular-prism test to identify Struvite among Debris predictions."""
+#     if patch is None or patch.size == 0:
+#         return False, "empty_patch", {}
+#     crop, bg = extract_foreground_crop(patch)
+#     if crop is None or crop.size == 0:
+#         return False, "empty_foreground", {}
+#     return verify_struvite(
+#         crop, bg, meta,
+#         min_max_side=min_side, min_area=600.0,
+#         min_rectangularity=0.80, min_solidity=0.90,
+#         min_verts=4, max_verts=6, max_aspect=4.5, max_circ=0.80,
+#         cluster_min_area=1e12, cluster_min_lines=10 ** 6,
+#         eps_frac=0.02, min_contrast=30.0,
+#     )
+#
+#
 
 def verify_gated_object(
     patch_or_crop: Optional[np.ndarray],
     predicted_class: str,
     meta: Optional[Dict[str, Any]] = None,
-    rejection_class: str = "Debris"
+    rejection_class: Optional[str] = None,
 ) -> Tuple[bool, str, str, Dict[str, Any]]:
     """
     Main gating verification entrypoint.
@@ -395,7 +704,7 @@ def verify_gated_object(
         patch_or_crop: Patch image (80x80 / 224x224) or tight crop as a numpy array.
         predicted_class: Class name produced by detector or classifier.
         meta: Optional metadata dict with keys like 'raw_w', 'raw_h', 'area', 'aspect_ratio'.
-        rejection_class: Class to reassign if verification fails (default: 'Debris').
+        rejection_class: Class to reassign if verification fails (default: '<predicted_class>_rejected').
 
     Returns:
         is_verified (bool): True if verified, False if rejected by gating.
@@ -407,14 +716,17 @@ def verify_gated_object(
     if not is_gated_class(predicted_class):
         return True, predicted_class, "class_not_gated", {}
 
+    if rejection_class is None:
+        rejection_class = f"{predicted_class}_rejected"
+
     if patch_or_crop is None or patch_or_crop.size == 0:
         return False, rejection_class, "empty_patch_or_crop", {}
+
+    cls_lower = predicted_class.lower()
 
     crop, bg = extract_foreground_crop(patch_or_crop)
     if crop is None or crop.size == 0:
         return False, rejection_class, "empty_foreground", {}
-
-    cls_lower = predicted_class.lower()
 
     if cls_lower == "co_di":
         ok, reason, metrics = verify_codi(crop, bg, meta)
@@ -426,6 +738,15 @@ def verify_gated_object(
         ok, reason, metrics = verify_wbc(crop, bg, meta)
     elif cls_lower == "yeast":
         ok, reason, metrics = verify_yeast(crop, bg, meta)
+    elif cls_lower == "ep_sq":
+        ok, reason, metrics = verify_ep_sq(crop, bg, meta)
+    elif cls_lower == "ep_tr":
+        ok, reason, metrics = verify_ep_tr(crop, bg, meta)
+    # Struvite morphology filtering is temporarily disabled for both labels.
+    # elif cls_lower == "struvite":
+    #     ok, reason, metrics = verify_struvite(crop, bg, meta)
+    # elif cls_lower == "small_struvite":
+    #     ok, reason, metrics = verify_small_struvite(crop, bg, meta)
     else:
         return True, predicted_class, "class_not_gated", {}
 
