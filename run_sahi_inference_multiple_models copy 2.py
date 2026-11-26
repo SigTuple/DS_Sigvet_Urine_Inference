@@ -257,11 +257,12 @@ def parse_args():
                    help="Do not save predictions_coco.json file")
     p.add_argument("--save_patch_classes", default="all", choices=["all", "classified_only"],
                    help="Which classes to save patches for: 'all' (all detections) or 'classified_only' (only Object classified by classifier)")
-    p.add_argument("--save_crop_type", default="tight", choices=["tight", "halo", "canvas"],
+    p.add_argument("--save_crop_type", default="training", choices=["training", "tight", "halo", "canvas"],
                    help="Format for saved patches in classification_result: "
-                        "'tight' (default: natural unscaled tight bbox crop img[y1:y2, x1:x2]), "
+                        "'training' (default: 80x80 fluid-canvas exactly as training dataset, cell at 1:1 scale + halo + fluid bg color), "
+                        "'tight' (natural unscaled tight bbox crop img[y1:y2, x1:x2]), "
                         "'halo' (unscaled crop with 8px/16px fluid halo), or "
-                        "'canvas' (padded 80x80/224x224 model canvas)")
+                        "'canvas' (padded 80x80/224x224 black canvas)")
     p.add_argument("--patch_dir_name", default="classification_result",
                    help="Subdirectory name inside output_dir to save class-wise patches (default: classification_result)")
     p.add_argument("--img_size", type=int, default=416, help="Slice / model input size")
@@ -574,17 +575,27 @@ def prepare_micro_patch(crop, target_size=80):
     return patch_80x80
 
 
-def get_crop_to_save(img, x1, y1, x2, y2, patch, crop_type="tight", halo=8):
+def get_crop_to_save(img, x1, y1, x2, y2, patch, crop_type="training", halo=8, target_size=80):
     """
     Returns the image patch to save to disk based on crop_type:
-    - 'tight': natural unscaled tight crop img[y1:y2, x1:x2] matching the detection bounding box
-    - 'halo': unscaled crop including natural fluid halo margin img[hy1:hy2, hx1:hx2]
-    - 'canvas': the full padded model canvas (80x80 or 224x224)
+    - 'training': extract_1to1_fluid_patch — identical to training dataset:
+                  cell at 1:1 scale + fluid halo, centered on fluid-colored canvas.
+    - 'tight'   : natural unscaled tight crop img[y1:y2, x1:x2]
+    - 'halo'    : unscaled crop including natural fluid halo surrounding
+    - 'canvas'  : the full padded model canvas (80x80 or 224x224) — old behaviour
     """
     if crop_type == "canvas":
         return patch
 
     ih, iw = img.shape[:2]
+
+    if crop_type == "training":
+        # Use same function as dataset generation: halo + fluid-colored canvas
+        box_w = x2 - x1
+        box_h = y2 - y1
+        result, _ = extract_1to1_fluid_patch(img, x1, y1, box_w, box_h, halo=halo, target_size=target_size)
+        return result if (result is not None and result.size > 0) else patch
+
     if crop_type == "halo":
         hx1 = max(0, x1 - halo)
         hy1 = max(0, y1 - halo)
@@ -592,9 +603,10 @@ def get_crop_to_save(img, x1, y1, x2, y2, patch, crop_type="tight", halo=8):
         hy2 = min(ih, y2 + halo)
         crop = img[hy1:hy2, hx1:hx2]
         return crop if (crop is not None and crop.size > 0) else patch
-    else:  # "tight"
-        crop = img[max(0, y1):min(ih, y2), max(0, x1):min(iw, x2)]
-        return crop if (crop is not None and crop.size > 0) else patch
+
+    # "tight"
+    crop = img[max(0, y1):min(ih, y2), max(0, x1):min(iw, x2)]
+    return crop if (crop is not None and crop.size > 0) else patch
 
 
 def get_patch(img, x1, y1, x2, y2, patch_size=224):
@@ -1041,8 +1053,9 @@ def process_single_order(
                             patch_save_path = os.path.join(cls_dir, patch_filename)
                             save_crop = get_crop_to_save(
                                 img, x1, y1, x2, y2, patch,
-                                crop_type=getattr(args, "save_crop_type", "tight"),
-                                halo=8 if max(box_width, box_height) <= args.size_threshold else 16
+                                crop_type=getattr(args, "save_crop_type", "training"),
+                                halo=8 if max(box_width, box_height) <= args.size_threshold else 16,
+                                target_size=80 if max(box_width, box_height) <= args.size_threshold else args.patch_size
                             )
                             if save_crop is not None and save_crop.size > 0:
                                 cv2.imwrite(patch_save_path, save_crop)
@@ -1117,8 +1130,9 @@ def process_single_order(
                 if should_save:
                     save_crop = get_crop_to_save(
                         img, x1, y1, x2, y2, patch,
-                        crop_type=getattr(args, "save_crop_type", "tight"),
-                        halo=8 if max(box_width, box_height) <= args.size_threshold else 16
+                        crop_type=getattr(args, "save_crop_type", "training"),
+                        halo=8 if max(box_width, box_height) <= args.size_threshold else 16,
+                        target_size=80 if max(box_width, box_height) <= args.size_threshold else args.patch_size
                     )
 
                     if save_crop is None or save_crop.size == 0:
@@ -1368,7 +1382,12 @@ def main():
     print(f"Mode                           : {'CSV ONLY (zero images/patches written)' if args.csv_only else 'Standard'}")
     print(f"Save Patches                   : {args.save_patches}")
     if args.save_patches:
-        crop_desc = 'unscaled tight crop' if args.save_crop_type == 'tight' else 'crop + fluid halo' if args.save_crop_type == 'halo' else 'model canvas (80x80/224x224)'
+        crop_desc = {
+            'training': 'fluid-canvas 80x80/224x224 (identical to training dataset)',
+            'tight': 'unscaled tight bbox crop',
+            'halo': 'unscaled crop + fluid halo',
+            'canvas': 'black-padded model canvas (80x80/224x224)',
+        }.get(args.save_crop_type, args.save_crop_type)
         print(f"  Patch Crop Format            : {args.save_crop_type} ({crop_desc})")
         print(f"  Patch Classes                : {args.save_patch_classes}")
     print(f"Save Annotated Bbox Images     : {args.save_annotated}")
