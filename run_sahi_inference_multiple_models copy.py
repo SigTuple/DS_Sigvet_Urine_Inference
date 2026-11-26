@@ -417,10 +417,8 @@ def extract_isolated_patch_black(img, bbox, patch_size=224, pad_ratio=0.15):
 
 def prepare_micro_patch(crop, target_size=80):
     """
-    Takes a tight cell crop and letterboxes it into an 80x80 patch:
-    - 100% aspect ratio preserved
-    - Longest side = 80 px
-    - Shorter side padded symmetrically with solid black [0, 0, 0]
+    Takes a cell crop and places it centered onto an 80x80 canvas at 1:1 scale (no upscaling).
+    Only downscales if the crop exceeds target_size, matching the training dataset standard.
     """
     if crop is None or crop.size == 0:
         return np.zeros((target_size, target_size, 3), dtype=np.uint8)
@@ -429,22 +427,22 @@ def prepare_micro_patch(crop, target_size=80):
     if ch == 0 or cw == 0:
         return np.zeros((target_size, target_size, 3), dtype=np.uint8)
 
-    # Step 1: Proportional scaling factor
-    scale = target_size / float(max(ch, cw))
-    new_w = max(1, int(round(cw * scale)))
-    new_h = max(1, int(round(ch * scale)))
+    # Downscale ONLY if crop exceeds target_size (never upscale small cells)
+    if max(ch, cw) > target_size:
+        scale = target_size / float(max(ch, cw))
+        new_w = max(1, int(round(cw * scale)))
+        new_h = max(1, int(round(ch * scale)))
+        resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        ch, cw = resized.shape[:2]
+    else:
+        resized = crop
 
-    # Step 2: Resize maintaining aspect ratio
-    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-    resized = cv2.resize(crop, (new_w, new_h), interpolation=interp)
+    # Symmetric padding to reach exactly target_size
+    pad_top = (target_size - ch) // 2
+    pad_bottom = target_size - ch - pad_top
+    pad_left = (target_size - cw) // 2
+    pad_right = target_size - cw - pad_left
 
-    # Step 3: Symmetric padding to reach exactly 80x80
-    pad_top = (target_size - new_h) // 2
-    pad_bottom = target_size - new_h - pad_top
-    pad_left = (target_size - new_w) // 2
-    pad_right = target_size - new_w - pad_left
-
-    # Solid black padding (NO MIRRORS)
     patch_80x80 = cv2.copyMakeBorder(
         resized,
         top=pad_top,

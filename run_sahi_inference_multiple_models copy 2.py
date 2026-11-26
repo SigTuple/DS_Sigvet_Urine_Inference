@@ -530,10 +530,8 @@ def extract_isolated_patch_black(img, bbox, patch_size=224, pad_ratio=0.15):
 
 def prepare_micro_patch(crop, target_size=80):
     """
-    Takes a tight cell crop and letterboxes it into an 80x80 patch:
-    - 100% aspect ratio preserved
-    - Longest side = 80 px
-    - Shorter side padded symmetrically with solid black [0, 0, 0]
+    Takes a cell crop and places it centered onto an 80x80 canvas at 1:1 scale (no upscaling).
+    Only downscales if the crop exceeds target_size, matching the training dataset standard.
     """
     if crop is None or crop.size == 0:
         return np.zeros((target_size, target_size, 3), dtype=np.uint8)
@@ -542,22 +540,22 @@ def prepare_micro_patch(crop, target_size=80):
     if ch == 0 or cw == 0:
         return np.zeros((target_size, target_size, 3), dtype=np.uint8)
 
-    # Step 1: Proportional scaling factor
-    scale = target_size / float(max(ch, cw))
-    new_w = max(1, int(round(cw * scale)))
-    new_h = max(1, int(round(ch * scale)))
+    # Downscale ONLY if crop exceeds target_size (never upscale small cells)
+    if max(ch, cw) > target_size:
+        scale = target_size / float(max(ch, cw))
+        new_w = max(1, int(round(cw * scale)))
+        new_h = max(1, int(round(ch * scale)))
+        resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        ch, cw = resized.shape[:2]
+    else:
+        resized = crop
 
-    # Step 2: Resize maintaining aspect ratio
-    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-    resized = cv2.resize(crop, (new_w, new_h), interpolation=interp)
+    # Symmetric padding to reach exactly target_size
+    pad_top = (target_size - ch) // 2
+    pad_bottom = target_size - ch - pad_top
+    pad_left = (target_size - cw) // 2
+    pad_right = target_size - cw - pad_left
 
-    # Step 3: Symmetric padding to reach exactly 80x80
-    pad_top = (target_size - new_h) // 2
-    pad_bottom = target_size - new_h - pad_top
-    pad_left = (target_size - new_w) // 2
-    pad_right = target_size - new_w - pad_left
-
-    # Solid black padding (NO MIRRORS)
     patch_80x80 = cv2.copyMakeBorder(
         resized,
         top=pad_top,
@@ -908,7 +906,6 @@ def process_single_order(
                         patch = prepare_micro_patch(tight_crop, target_size=80)
                     selected_classifier = micro_classifier
                     model_used = "micro"
-                    norm_meta = normalize_box_metadata(box_height, box_width)
                 else:
                     if use_fluid:
                         patch, meta_dict = extract_1to1_fluid_patch(
@@ -919,10 +916,17 @@ def process_single_order(
                         patch = extract_isolated_patch_black(img, bbox, patch_size=args.patch_size)
                     selected_classifier = macro_classifier
                     model_used = "macro"
-                    norm_meta = None
+
+                # Metadata vector matching training dataset format [log_w, log_h, log_area, ar]
+                if getattr(args, "meta_type", "log") == "log" and meta_dict is not None and "vector_4d" in meta_dict:
+                    cls_meta = meta_dict["vector_4d"]
+                elif getattr(args, "meta_type", "log") == "norm":
+                    cls_meta = normalize_box_metadata(box_height, box_width)
+                else:
+                    cls_meta = None
 
                 if patch is not None:
-                    cls_name_classify, cls_conf = selected_classifier.predict(patch, metadata=norm_meta)
+                    cls_name_classify, cls_conf = selected_classifier.predict(patch, metadata=cls_meta)
                     cls_time += (time.perf_counter() - t_cls_start)
                     patch_count += 1
                     final_cls = cls_name_classify
