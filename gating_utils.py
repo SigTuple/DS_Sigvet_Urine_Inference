@@ -19,6 +19,7 @@ from typing import Dict, Any, Tuple, Optional, Union, List
 GATED_CLASSES = {
     "CO_DI",
     "RBC",
+    "unstained_rbc",
     "WBC",
     "Yeast",
     "small_sperm",
@@ -31,7 +32,7 @@ def is_gated_class(class_name: Optional[str]) -> bool:
     """Returns True if the class has gating verification rules."""
     if not class_name:
         return False
-    return class_name in GATED_CLASSES or class_name.lower() in {"sperm", "small_sperm", "co_di", "rbc", "wbc", "yeast"}
+    return class_name in GATED_CLASSES or class_name.lower() in {"sperm", "small_sperm", "co_di", "rbc", "unstained_rbc", "wbc", "yeast"}
 
 
 def extract_foreground_crop(img: np.ndarray) -> Tuple[Optional[np.ndarray], float]:
@@ -478,7 +479,7 @@ def verify_gated_object(
 
     if cls_lower == "co_di":
         ok, reason, metrics = verify_codi(crop, bg, meta)
-    elif cls_lower == "rbc":
+    elif cls_lower in ("rbc", "unstained_rbc"):
         ok, reason, metrics = verify_rbc(crop, bg, meta)
     elif cls_lower in ("small_sperm", "sperm"):
         ok, reason, metrics = verify_sperm(crop, bg, meta)

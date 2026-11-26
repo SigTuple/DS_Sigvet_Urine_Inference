@@ -34,9 +34,10 @@ MACRO_CLASSES = [
     "Debris",
     "EP_SQ",
     "EP_TR",
-    "fungal_hyphae",
+    "Granular_cast",
     "Sperm",
     "Struvite",
+    "fungal_hyphae",
 ]
 
 MICRO_CLASSES = [
@@ -50,6 +51,7 @@ MICRO_CLASSES = [
     "small_sperm",
     "small_struvite",
     "unknown_crystals",
+    "unstained_rbc",
 ]
 
 MICRO_METADATA_MEAN = np.array([39.7208, 40.0455, 1.0283, 1695.2015], dtype=np.float32)

@@ -73,11 +73,19 @@ if not os.path.exists(DEFAULT_DET_MODEL):
 
 DEFAULT_MACRO_MODEL = "/media/sigtupleds/Data/urine_inference/models/urine_macro_mobilenetv4_gem_msfm_iter_2.onnx"
 if not os.path.exists(DEFAULT_MACRO_MODEL):
-    DEFAULT_MACRO_MODEL = "/media/sigtupleds/Data/urine_inference/models/urine_macro_mobilenetv4_gem_msfm_iter_2.onnx"
+    _local_macro = "/Users/benjaminroyv/Downloads/urine_macro_1to1_fluid_iter4_mobilenetv4_metadata_best.onnx"
+    if os.path.exists(_local_macro):
+        DEFAULT_MACRO_MODEL = _local_macro
+    else:
+        DEFAULT_MACRO_MODEL = "/media/sigtupleds/Data/urine_inference/models/urine_macro_mobilenetv4_gem_msfm_iter_2.onnx"
 
 DEFAULT_MICRO_MODEL = "/home/sigtuple/DS/SAHI_Wrapper_yolov26/SAHI_Wrapper_yolov26/urine_micro_metadata_mlp_mobilenet_gem_equal_stage_msfm_final_checkpoint.onnx"
 if not os.path.exists(DEFAULT_MICRO_MODEL):
-    DEFAULT_MICRO_MODEL = "/home/sigtuple/DS/SAHI_Wrapper_yolov26/SAHI_Wrapper_yolov26/urine_micro_metadata_mlp_mobilenet_gem_equal_stage_msfm_final_checkpoint.onnx"
+    _local_micro = "/Users/benjaminroyv/Downloads/urine_micro_1to1_fluid_iter4_efficientnet_v2_metadata_best.onnx"
+    if os.path.exists(_local_micro):
+        DEFAULT_MICRO_MODEL = _local_micro
+    else:
+        DEFAULT_MICRO_MODEL = "/home/sigtuple/DS/SAHI_Wrapper_yolov26/SAHI_Wrapper_yolov26/urine_micro_metadata_mlp_mobilenet_gem_equal_stage_msfm_final_checkpoint.onnx"
 
 
 
@@ -133,9 +141,10 @@ MACRO_CLASSES = [
     "Debris",
     "EP_SQ",
     "EP_TR",
-    "fungal_hyphae",
+    "Granular_cast",
     "Sperm",
     "Struvite",
+    "fungal_hyphae",
 ]
 
 MICRO_CLASSES = [
@@ -149,6 +158,7 @@ MICRO_CLASSES = [
     "small_sperm",
     "small_struvite",
     "unknown_crystals",
+    "unstained_rbc",
 ]
 
 ALL_CLASSIFIER_CLASSES = list(dict.fromkeys(MACRO_CLASSES + MICRO_CLASSES))
@@ -157,6 +167,7 @@ CLASSIFIER_CLASSES = ALL_CLASSIFIER_CLASSES
 STANDARD_CLASSIFIED_CLASSES = [
     "Bacteria",
     "RBC",
+    "unstained_rbc",
     "WBC",
     "EP_SQ",
     "EP_TR",
